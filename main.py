@@ -3,23 +3,21 @@
 import time
 import logging
 import argparse
-import json 
+import json
 from queue import Queue
+from threading import Thread
 
+# --- Import our custom modules ---
 from sniffer import PacketSniffer
 from detection import DetectionEngine
-
+from api import run_api_server
 class JsonFormatter(logging.Formatter):
-    """
-    Custom logging formatter to output logs in JSON format.
-    """
     def format(self, record):
         log_object = {
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "message": record.getMessage()
         }
-        # If the log record has extra data, add it to the json object.
         if hasattr(record, 'extra_data'):
             log_object.update(record.extra_data)
         return json.dumps(log_object)
@@ -30,7 +28,6 @@ class Config:
         self.LOG_FILE = log_file
 
 def setup_logging(log_file):
-    """Configures logging for the application."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -39,15 +36,13 @@ def setup_logging(log_file):
     alert_logger = logging.getLogger('nids_alerts')
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.WARNING)
-    # Set the JsonFormatter for the file handler.
     file_handler.setFormatter(JsonFormatter())
-
     alert_logger.addHandler(file_handler)
     alert_logger.propagate = False
 
 def main():
-    """The main function to run the NIDS."""
-    parser = argparse.ArgumentParser(description="A simple Python-based Network Intrusion Detection System.")
+    """The main function to run the NIDS and the API."""
+    parser = argparse.ArgumentParser(description="A Python-based Network Intrusion Detection System with a Web API.")
     parser.add_argument('-i', '--interface', type=str, required=True, help="Network interface to sniff on.")
     parser.add_argument('-l', '--logfile', type=str, default='alerts.log', help="File to save security alerts to.")
     args = parser.parse_args()
@@ -60,12 +55,17 @@ def main():
     sniffer = PacketSniffer(config, packet_queue)
     detector = DetectionEngine(packet_queue, interface=config.INTERFACE)
 
+    api_thread = Thread(target=run_api_server, daemon=True)
+
     try:
         sniffer.start()
         detector.start()
-        logging.info("NIDS is running. Press Ctrl+C to stop.")
+        api_thread.start() # Start the API server
+        
+        logging.info("NIDS and API are running. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
+
     except KeyboardInterrupt:
         logging.info("\nShutdown signal received. Stopping NIDS...")
     finally:

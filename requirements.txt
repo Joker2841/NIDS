@@ -1,2 +1,6 @@
 scapy
 requests
+Flask
+streamlit
+pandas
+Flask-SocketIO

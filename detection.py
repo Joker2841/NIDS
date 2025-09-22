@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 from scapy.all import TCP, IP, ARP
 
 from utils import get_ip_geolocation, get_gateway_info
+from api import alert_queue
 
 alert_logger = logging.getLogger('nids_alerts')
 alert_logger.setLevel(logging.WARNING)
@@ -18,9 +19,18 @@ class DetectionEngine:
         self.packet_queue = packet_queue
         self.is_running = Event()
         self.analysis_thread = None
+        
+        # --- Port Scan State ---
         self.port_scan_tracker = defaultdict(lambda: deque(maxlen=21))
         self.PORT_SCAN_THRESHOLD = 20
         self.PORT_SCAN_TIME_WINDOW = 10
+        
+        # --- SYN Flood State ---
+        self.syn_flood_tracker = defaultdict(list)
+        self.SYN_FLOOD_THRESHOLD = 50  # Num of SYN packets
+        self.SYN_FLOOD_TIME_WINDOW = 5   # In seconds
+        
+        # --- ARP Spoofing State ---
         self.gateway_ip, _ = get_gateway_info()
         self.arp_table = {}
 
@@ -35,87 +45,89 @@ class DetectionEngine:
         if packet.haslayer(ARP):
             self._detect_arp_spoofing(packet)
             return
+            
         if not packet.haslayer(TCP) or not packet.haslayer(IP):
             return
+        
         src_ip = packet[IP].src
-        self._detect_port_scan(packet, src_ip)
         tcp_flags = packet[TCP].flags
+        
+        self._detect_syn_flood(packet, src_ip, tcp_flags)
+
+        self._detect_port_scan(packet, src_ip)
+        
         FIN, PSH, URG = 0x01, 0x08, 0x20
         if tcp_flags == 0:
             self._trigger_alert("TCP NULL Scan", packet)
         elif tcp_flags & (FIN | PSH | URG) == (FIN | PSH | URG):
             self._trigger_alert("TCP XMAS Scan", packet)
 
-    def _detect_arp_spoofing(self, packet):
-        if packet[ARP].op != 2:
+    def _detect_syn_flood(self, packet, src_ip, flags):
+        # We only care about packets that are just SYN (flag=2)
+        SYN = 0x02
+        if flags != SYN:
             return
-        src_ip = packet[ARP].psrc
-        src_mac = packet[ARP].hwsrc
+
+        current_time = time.time()
+        
+        # Remove old timestamps that are outside the time window
+        self.syn_flood_tracker[src_ip] = [t for t in self.syn_flood_tracker[src_ip] if current_time - t < self.SYN_FLOOD_TIME_WINDOW]
+        
+        # Add the current timestamp
+        self.syn_flood_tracker[src_ip].append(current_time)
+        
+        # If the number of SYN packets exceeds the threshold, trigger an alert
+        if len(self.syn_flood_tracker[src_ip]) > self.SYN_FLOOD_THRESHOLD:
+            extra_details = {"syn_packet_count": len(self.syn_flood_tracker[src_ip])}
+            self._trigger_alert("SYN Flood Attack", packet, extra_data=extra_details)
+            # Clear the tracker for this IP to avoid repeated alerts
+            self.syn_flood_tracker.pop(src_ip, None)
+
+
+    def _detect_arp_spoofing(self, packet):
+        if packet[ARP].op != 2: return
+        src_ip, src_mac = packet[ARP].psrc, packet[ARP].hwsrc
         if src_ip == self.gateway_ip:
             if src_ip in self.arp_table and self.arp_table[src_ip] != src_mac:
-                extra_details = {
-                    "original_mac": self.arp_table[src_ip],
-                    "new_mac": src_mac
-                }
+                extra_details = {"original_mac": self.arp_table[src_ip], "new_mac": src_mac}
                 self._trigger_alert("ARP Spoofing", packet, extra_data=extra_details)
             else:
-                if src_ip not in self.arp_table:
-                    print(f"[*] Learning gateway MAC: {self.gateway_ip} -> {src_mac}")
+                if src_ip not in self.arp_table: print(f"[*] Learning gateway MAC: {self.gateway_ip} -> {src_mac}")
                 self.arp_table[src_ip] = src_mac
 
     def _detect_port_scan(self, packet, src_ip):
-        current_time = time.time()
-        dest_port = packet[TCP].dport
+        current_time, dest_port = time.time(), packet[TCP].dport
         self.port_scan_tracker[src_ip].append((current_time, dest_port))
         if len(self.port_scan_tracker[src_ip]) > self.PORT_SCAN_THRESHOLD:
             first_attempt_time, _ = self.port_scan_tracker[src_ip][0]
             if (current_time - first_attempt_time) <= self.PORT_SCAN_TIME_WINDOW:
                 scanned_ports = sorted(list({port for _, port in self.port_scan_tracker[src_ip]}))
-                extra_details = { "scanned_ports": scanned_ports }
+                extra_details = {"scanned_ports": scanned_ports}
                 self._trigger_alert("Port Scan", packet, extra_data=extra_details)
                 self.port_scan_tracker.pop(src_ip, None)
-    
+
     def _trigger_alert(self, alert_type: str, packet, extra_data=None):
-        """
-        Logs a security alert by passing a dictionary of details to the logger.
-        """
-        # Create a dictionary with the core alert details
-        details = {
-            "alert_type": alert_type,
-            "summary": packet.summary()
-        }
-        
-        # Add IP and Geolocation info if available
+        details = {"alert_type": alert_type, "timestamp": time.time(), "summary": packet.summary()}
         if packet.haslayer(IP):
             src_ip = packet[IP].src
-            details['source_ip'] = src_ip
-            details['destination_ip'] = packet[IP].dst
+            details['source_ip'], details['destination_ip'] = src_ip, packet[IP].dst
             details['location'] = get_ip_geolocation(src_ip)
-        
-        # Add MAC info for ARP packets
         if packet.haslayer(ARP):
             details['source_mac'] = packet[ARP].hwsrc
-
-        # Merge any extra data from the specific rule (like scanned ports)
-        if extra_data:
-            details.update(extra_data)
-        
-        # Log the message, passing the dictionary in the 'extra' parameter.
-        # Our custom JsonFormatter will know how to handle this.
+        if extra_data: details.update(extra_data)
         alert_logger.warning(f"{alert_type} Detected", extra={'extra_data': details})
+        alert_queue.put(details)
 
     def start(self):
-        if self.analysis_thread and self.analysis_thread.is_alive():
-            print("[!] Detection engine is already running.")
-            return
+        if self.analysis_thread and self.analysis_thread.is_alive(): return
         self.is_running.clear()
         self.analysis_thread = Thread(target=self._analyze_packets, daemon=True)
         self.analysis_thread.start()
+        
     def stop(self):
         print("[*] Stopping detection engine...")
         self.is_running.set()
-        if self.analysis_thread and self.analysis_thread.is_alive():
-            self.analysis_thread.join(timeout=2)
+        if self.analysis_thread and self.analysis_thread.is_alive(): self.analysis_thread.join(timeout=2)
         print("[*] Detection engine stopped.")
 
 

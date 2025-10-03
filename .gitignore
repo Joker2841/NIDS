@@ -29,4 +29,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Git SSH keys
+NIDS_KEY
+NIDS_KEY.pub
+
 

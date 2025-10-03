@@ -3,114 +3,172 @@
 import threading
 import time
 from queue import Queue
+import logging
 
 from scapy.all import sniff, Scapy_Exception
 
 class PacketSniffer:
     """
-    A class to sniff network packets in a separate thread.
-
-    Attributes:
-        config (object): The configuration object with settings like INTERFACE.
-        packet_queue (Queue): A thread-safe queue to store captured packets.
-        is_running (bool): A flag to control the sniffing loop.
-        sniffer_thread (threading.Thread): The thread that runs the packet sniffing.
+    Enhanced packet sniffer with BPF filtering and better error handling.
     """
     def __init__(self, config, packet_queue: Queue):
-        """
-        Initializes the PacketSniffer.
-
-        Args:
-            config (object): A configuration object containing NIDS settings.
-            packet_queue (Queue): The queue where captured packets will be placed.
-        """
         self.config = config
         self.packet_queue = packet_queue
         self.is_running = threading.Event()
         self.sniffer_thread = None
+        self.logger = logging.getLogger(__name__)
+        
+        # Statistics
+        self.packets_captured = 0
+        self.packets_dropped = 0
+        
+        print(f"[*] Packet sniffer initialized for interface: {config.INTERFACE}")
 
     def _sniff_packets(self):
-        """
-        The core sniffing function, intended to be run in a separate thread.
-        Uses Scapy's sniff function to capture packets and put them in the queue.
-        """
+        """Enhanced sniffing function with BPF filters and error handling"""
         print(f"[*] Starting packet sniffing on interface '{self.config.INTERFACE}'...")
-        while not self.is_running.is_set():
+        
+        # BPF filter to capture only relevant packets
+        packet_filter = "tcp or arp or icmp or (udp and port 53)"  # Include DNS
+        
+        retry_count = 0
+        max_retries = 3
+        
+        while not self.is_running.is_set() and retry_count < max_retries:
             try:
-                # The 'prn' argument specifies a function to be called for each packet sniffed.
-                # The 'store=0' argument tells Scapy not to store the packets in memory.
-                # The 'stop_filter' is a more efficient way to stop sniffing.
                 sniff(
                     iface=self.config.INTERFACE,
-                    prn=lambda packet: self.packet_queue.put(packet),
+                    filter=packet_filter,
+                    prn=self._process_packet,
                     store=0,
+                    timeout=1,
                     stop_filter=lambda p: self.is_running.is_set()
                 )
+                retry_count = 0  # Reset retry count on successful sniffing
+                
             except Scapy_Exception as e:
-                # This handles cases where the interface might not be ready or available.
-                print(f"[!] Scapy error on interface {self.config.INTERFACE}: {e}")
-                print("[!] Retrying in 5 seconds...")
-                time.sleep(5)
+                retry_count += 1
+                self.logger.error(f"Scapy error on interface {self.config.INTERFACE}: {e}")
+                if retry_count < max_retries:
+                    print(f"[!] Retrying in 5 seconds... (attempt {retry_count}/{max_retries})")
+                    time.sleep(5)
+                else:
+                    print(f"[!] Max retries reached. Stopping sniffer.")
+                    break
+                    
+            except PermissionError:
+                print("[!] Permission denied. Please run with sudo/administrator privileges.")
+                break
+                
             except Exception as e:
-                print(f"[!] An unexpected error occurred during sniffing: {e}")
-                self.stop()
+                retry_count += 1
+                self.logger.error(f"Unexpected error during sniffing: {e}")
+                if retry_count < max_retries:
+                    print(f"[!] Unexpected error. Retrying in 5 seconds... (attempt {retry_count}/{max_retries})")
+                    time.sleep(5)
+                else:
+                    print(f"[!] Max retries reached. Stopping sniffer.")
+                    break
 
+    def _process_packet(self, packet):
+        """Process captured packet with error handling and queue management"""
+        try:
+            self.packets_captured += 1
+            
+            # Prevent memory issues by limiting queue size
+            if self.packet_queue.qsize() < 1000:
+                self.packet_queue.put(packet)
+            else:
+                self.packets_dropped += 1
+                if self.packets_dropped % 100 == 0:  # Log every 100 dropped packets
+                    print(f"[!] Warning: Dropped {self.packets_dropped} packets due to queue overflow")
+                    
+        except Exception as e:
+            self.logger.error(f"Error processing packet: {e}")
+
+    def get_statistics(self):
+        """Get sniffer statistics"""
+        return {
+            'packets_captured': self.packets_captured,
+            'packets_dropped': self.packets_dropped,
+            'queue_size': self.packet_queue.qsize()
+        }
 
     def start(self):
-        """Starts the packet sniffing thread."""
+        """Start the packet sniffing thread with validation"""
         if self.sniffer_thread and self.sniffer_thread.is_alive():
             print("[!] Sniffer is already running.")
-            return
+            return False
 
-        self.is_running.clear()  # Clear the event flag before starting
+        # Validate interface before starting
+        try:
+            import netifaces
+            if self.config.INTERFACE not in netifaces.interfaces():
+                available_interfaces = netifaces.interfaces()
+                print(f"[!] Interface '{self.config.INTERFACE}' not found.")
+                print(f"[!] Available interfaces: {available_interfaces}")
+                return False
+        except ImportError:
+            print("[!] Warning: netifaces not installed. Cannot validate interface.")
+
+        self.is_running.clear()
         self.sniffer_thread = threading.Thread(target=self._sniff_packets, daemon=True)
         self.sniffer_thread.start()
+        return True
 
     def stop(self):
-        """Stops the packet sniffing thread."""
+        """Stop the packet sniffing thread"""
         print("[*] Stopping packet sniffing...")
         self.is_running.set()
+        
         if self.sniffer_thread and self.sniffer_thread.is_alive():
-            # Wait for the thread to finish its current packet processing
-            self.sniffer_thread.join(timeout=2)
-        print("[*] Packet sniffing stopped.")
+            self.sniffer_thread.join(timeout=5)
+            
+        # Print final statistics
+        stats = self.get_statistics()
+        print(f"[*] Packet sniffing stopped. Captured: {stats['packets_captured']}, Dropped: {stats['packets_dropped']}")
 
 
 # --- Testing Block ---
 if __name__ == '__main__':
-    # This is a simple test to ensure the sniffer module works as expected.
-    # It demonstrates how to start the sniffer and retrieve packets from the queue.
-
-    # Mock config object for testing purposes
-    class MockConfig:
-        INTERFACE = "eth0" # Change this to your WSL interface name if different
-
-    print("--- Running Sniffer Module Test ---")
+    import sys
+    import os
     
-    # 1. Find your WSL interface name by running 'ip addr' in the WSL terminal.
-    #    It's often 'eth0' or 'eth1'.
+    # Mock config for testing
+    class MockConfig:
+        INTERFACE = "eth0"  # Change this to your interface
+    
+    print("--- Running Enhanced Sniffer Module Test ---")
     print("Please ensure you're running this script with sudo.")
-    print(f"Using interface: {MockConfig.INTERFACE}. If this is wrong, edit the script.")
+    
+    if os.geteuid() != 0:
+        print("[!] This script requires root privileges. Please run with sudo.")
+        sys.exit(1)
     
     test_queue = Queue()
     config = MockConfig()
     
     sniffer = PacketSniffer(config, test_queue)
-    sniffer.start()
     
-    print("\n[*] Sniffer started. Capturing first 5 packets for this test...")
+    if not sniffer.start():
+        print("[!] Failed to start sniffer.")
+        sys.exit(1)
+    
+    print("\n[*] Sniffer started. Capturing packets for 10 seconds...")
     
     try:
-        packets_captured = 0
-        while packets_captured < 5:
+        start_time = time.time()
+        while time.time() - start_time < 10:
             if not test_queue.empty():
                 packet = test_queue.get()
-                print(f"  -> Captured Packet: {packet.summary()}")
-                packets_captured += 1
-            else:
-                time.sleep(0.1) # Wait a bit for packets to arrive
+                print(f"  -> Captured: {packet.summary()}")
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("\n[!] User interrupted the test.")
     finally:
         sniffer.stop()
-        print("\n--- Sniffer Module Test Finished ---")
+        stats = sniffer.get_statistics()
+        print(f"\n--- Test Results ---")
+        print(f"Packets captured: {stats['packets_captured']}")
+        print(f"Packets dropped: {stats['packets_dropped']}")
+        print("--- Enhanced Sniffer Module Test Finished ---")
